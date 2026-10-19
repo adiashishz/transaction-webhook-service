@@ -1,0 +1,39 @@
+# Production on a single EC2 host. Postgres is AWS RDS (configured in .env), so no db service here.
+# Usage: docker compose -f docker-compose.prod.yml up -d --build
+services:
+  redis:
+    image: redis:7-alpine
+    # Append-only file so queued tasks survive a Redis restart. Postgres is still the source of truth.
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  web:
+    build: .
+    env_file: .env
+    ports:
+      - "80:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: celery -A config worker --beat --schedule /tmp/celerybeat-schedule --pool=threads --concurrency=32 --loglevel=info
+    env_file: .env
+    # Warm shutdown lets in-flight 30s tasks finish before the container stops.
+    stop_grace_period: 45s
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis_data:
