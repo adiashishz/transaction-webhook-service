@@ -2,8 +2,8 @@
 
 A Django service that receives transaction webhooks from payment processors (such as Razorpay). It acknowledges each one in milliseconds and processes the transaction reliably in the background.
 
-- **Live API:** `http://<to-be-added-after-deploy>`
-- **Interactive docs (Swagger):** `/docs/`
+- **Live API:** http://13.205.42.255 (AWS `ap-south-1`: EC2 + RDS PostgreSQL)
+- **Interactive docs (Swagger):** http://13.205.42.255/docs/
 
 ## API
 
@@ -14,7 +14,7 @@ A Django service that receives transaction webhooks from payment processors (suc
 | `GET` | `/v1/transactions/{transaction_id}` | Transaction status, returned as a single-item list (matching the spec). `404` if unknown |
 
 ```bash
-BASE=http://localhost:8000
+BASE=http://13.205.42.255    # or http://localhost:8000 when running locally
 
 # Send a webhook -> 202
 curl -i -X POST $BASE/v1/webhooks/transactions -H 'Content-Type: application/json' -d '{
@@ -56,7 +56,7 @@ flowchart LR
 
 | Requirement | How |
 |---|---|
-| 202 within 500ms | The request path is one indexed INSERT plus a commit, and the broker publish happens off-thread. Measured locally: ~30ms for a single webhook, p95 ~140ms with 100 concurrent webhooks, ~10ms with Redis stopped. |
+| 202 within 500ms | The request path is one indexed INSERT plus a commit, and the broker publish happens off-thread. Measured on the live deployment: ~80ms for a single webhook from a client in India, and a server-side p95 under 200ms with 100 concurrent webhooks. Locally, ~10ms with Redis stopped. |
 | 30s background processing | Celery task with a configurable delay (`TRANSACTION_PROCESSING_DELAY_SECONDS`). The thread pool (32 threads) runs many sleeps in parallel because the work is I/O-bound. |
 | Idempotency | A `UNIQUE` constraint on `transaction_id`. Concurrent duplicates race on the constraint and exactly one wins; this is tested with 8 simultaneous threads. Only the winner enqueues a task. The task's conditional update protects against duplicate deliveries. |
 | Persistent storage | PostgreSQL (AWS RDS) stores status, `created_at`, `processed_at` and `updated_at`. |
@@ -150,7 +150,7 @@ All settings come from environment variables (see `.env.example`).
 
 ## Deployment (AWS)
 
-- **RDS** PostgreSQL 16 (free tier). It is not publicly accessible; its security group allows only the EC2 instance.
+- **RDS** PostgreSQL 18 (free tier). It is not publicly accessible; its security group allows only the EC2 instance.
 - **EC2** (free tier) with an Elastic IP. Set up the instance like this:
   ```bash
   cp .env.example .env
