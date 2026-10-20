@@ -13,9 +13,12 @@ class Transaction(models.Model):
     transaction_id = models.CharField(max_length=255, unique=True)
     source_account = models.CharField(max_length=255)
     destination_account = models.CharField(max_length=255)
-    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    # 15 significant digits round-trip exactly through a JSON float (the response renders amount as a number).
+    amount = models.DecimalField(max_digits=15, decimal_places=2)
     currency = models.CharField(max_length=3)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PROCESSING)
+    # Lease held by the worker running the external call; doubles as the fencing token for completion.
+    processing_started_at = models.DateTimeField(null=True, blank=True)
     processed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

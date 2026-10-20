@@ -2,6 +2,7 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.transactions.models import Transaction
@@ -29,22 +30,40 @@ class TransactionService:
 
     @staticmethod
     def claim(txn_pk):
-        """Touch a PROCESSING row so the recovery sweep sees it as in-flight. Returns False if the
-        transaction was already processed (e.g. a redelivered task)."""
-        claimed = Transaction.objects.filter(pk=txn_pk, status=Transaction.Status.PROCESSING).update(
-            updated_at=timezone.now()
+        """Take the exclusive processing lease. Returns a claim token, or None if the transaction is already
+        processed or another worker holds a live lease.
+
+        A single conditional UPDATE: Postgres re-checks the WHERE clause under the row lock, so when two
+        deliveries race exactly one claims the row and runs the external call. A lease older than
+        TRANSACTION_PROCESSING_LEASE_SECONDS belongs to a crashed worker and may be taken over. Touching
+        updated_at also tells the recovery sweep the row is in flight.
+        """
+        now = timezone.now()
+        lease_expired_before = now - timedelta(seconds=settings.TRANSACTION_PROCESSING_LEASE_SECONDS)
+        claimed = (
+            Transaction.objects.filter(pk=txn_pk, status=Transaction.Status.PROCESSING)
+            .filter(Q(processing_started_at__isnull=True) | Q(processing_started_at__lt=lease_expired_before))
+            .update(processing_started_at=now, updated_at=now)
         )
-        return bool(claimed)
+        return now if claimed else None
 
     @staticmethod
-    def complete(txn_pk):
-        """Mark a transaction processed. The status condition makes this a no-op for a transaction
-        that was already completed, so a redelivered task can never process twice."""
+    def complete(txn_pk, token):
+        """Mark a transaction processed. The token fences the write: only the worker whose lease is current
+        can complete, and a transaction that is already processed is never updated again."""
         now = timezone.now()
-        updated = Transaction.objects.filter(pk=txn_pk, status=Transaction.Status.PROCESSING).update(
-            status=Transaction.Status.PROCESSED, processed_at=now, updated_at=now
-        )
+        updated = Transaction.objects.filter(
+            pk=txn_pk, status=Transaction.Status.PROCESSING, processing_started_at=token
+        ).update(status=Transaction.Status.PROCESSED, processed_at=now, updated_at=now)
         return bool(updated)
+
+    @staticmethod
+    def release(txn_pk, token):
+        """Give up a lease after a failure so a retry can claim the transaction straight away."""
+        released = Transaction.objects.filter(
+            pk=txn_pk, status=Transaction.Status.PROCESSING, processing_started_at=token
+        ).update(processing_started_at=None, updated_at=timezone.now())
+        return bool(released)
 
     @staticmethod
     def claim_stale():

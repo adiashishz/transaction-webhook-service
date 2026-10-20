@@ -74,6 +74,9 @@ def test_decimal_amount_and_lowercase_currency_are_normalised(client):
         webhook_payload(amount="abc"),
         webhook_payload(currency="RUPEE"),
         webhook_payload(currency="12A"),
+        webhook_payload(currency="ßßß"),
+        webhook_payload(currency="日本円"),
+        webhook_payload(amount="1234567890123456.78"),
         {k: v for k, v in webhook_payload().items() if k != "destination_account"},
     ],
 )

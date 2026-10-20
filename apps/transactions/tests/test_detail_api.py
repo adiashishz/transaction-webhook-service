@@ -2,7 +2,7 @@ import pytest
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from apps.transactions.tests.factories import create_transaction
+from apps.transactions.tests.factories import create_transaction, webhook_payload
 
 pytestmark = pytest.mark.django_db
 
@@ -42,3 +42,21 @@ def test_unknown_transaction_is_404(client):
     response = client.get("/v1/transactions/txn_missing")
 
     assert response.status_code == 404
+
+
+def test_largest_allowed_amount_round_trips_exactly(client):
+    client.post("/v1/webhooks/transactions", webhook_payload(transaction_id="txn_big", amount="9999999999999.99"), format="json")
+
+    item = client.get("/v1/transactions/txn_big").json()[0]
+
+    assert item["amount"] == 9999999999999.99
+    assert repr(item["amount"]) == "9999999999999.99"
+
+
+def test_transaction_id_containing_slash_is_retrievable(client):
+    create_transaction(transaction_id="order/123")
+
+    response = client.get("/v1/transactions/order/123")
+
+    assert response.status_code == 200
+    assert response.json()[0]["transaction_id"] == "order/123"
