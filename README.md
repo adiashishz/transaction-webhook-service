@@ -32,7 +32,7 @@ curl $BASE/v1/transactions/txn_abc123def456
 #   "status": "PROCESSING", "created_at": "...Z", "processed_at": null}]
 ```
 
-**Validation.** All fields are required. `amount` must be a positive decimal with at most 2 decimal places. `currency` must be a 3-letter code and is stored uppercased. An invalid body returns `400` and nothing is stored. A replay with the same `transaction_id` returns `202` with `"duplicate": true` and the original record is left untouched.
+**Validation.** All fields are required. `amount` must be a positive decimal with at most 2 decimal places and 15 digits in total, so it round-trips exactly as a JSON number. `currency` must be a 3-letter ASCII code and is stored uppercased. An invalid body returns `400` and nothing is stored. A replay with the same `transaction_id` returns `202` with `"duplicate": true` and the original record is left untouched.
 
 ## Architecture
 
@@ -43,13 +43,13 @@ flowchart LR
     W -->|2. 202 Accepted| P
     W -.->|3. enqueue after commit<br/>off the request thread| R[(Redis<br/>broker)]
     R --> C[Celery worker<br/>32 threads]
-    C -->|sleep 30s, then<br/>conditional UPDATE to PROCESSED| DB
+    C -->|claim lease, sleep 30s,<br/>fenced UPDATE to PROCESSED| DB
     B[Recovery sweep<br/>every 60s] -->|re-enqueue stale<br/>PROCESSING rows| R
 ```
 
 1. The webhook view validates the body and runs a single `INSERT` (via `get_or_create`) that stores the transaction as `PROCESSING`. The `202` is returned only after this commit, so **every acknowledged transaction is already durable in Postgres**.
-2. After the commit, the task is handed to Celery from a small background thread pool. A broker problem therefore can never slow the response. While testing, a stopped Redis made each publish stall for about 7s on DNS lookups; moving the publish off the request thread kept the webhook at about 10ms.
-3. The worker simulates the external call (`sleep 30`). It then marks the row `PROCESSED` with a **conditional update** (`WHERE status = 'PROCESSING'`), so a task that is delivered twice cannot process twice.
+2. After the commit, the task is handed to Celery by a few background daemon threads with a bounded queue. A broker problem therefore can never slow the response. While testing, a stopped Redis made each publish stall for about 7s on DNS lookups; moving the publish off the request thread kept the webhook at about 10ms. If the queue fills up during an outage, or the process exits with publishes pending, those rows are left to the recovery sweep.
+3. The worker first **claims an exclusive lease** on the row: a single conditional `UPDATE` that succeeds only if the row is still `PROCESSING` and no other worker holds a live lease. Postgres re-checks that condition under the row lock, so when deliveries race, **exactly one runs the external call** (`sleep 30`). A duplicate delivery skips immediately. The worker then marks the row `PROCESSED` with an update fenced on its lease token. A lease older than 2 minutes belongs to a crashed worker and can be taken over.
 4. A **recovery sweep** (Celery beat, every 60s) re-enqueues `PROCESSING` rows that haven't been touched for 5 minutes. This catches anything whose message was lost: a worker killed mid-task, Redis down at ingest time, or a process crash before the publish ran.
 
 ## How each requirement is met
@@ -58,7 +58,7 @@ flowchart LR
 |---|---|
 | 202 within 500ms | The request path is one indexed INSERT plus a commit, and the broker publish happens off-thread. Measured on the live deployment: ~80ms for a single webhook from a client in India, and a server-side p95 under 200ms with 100 concurrent webhooks. Locally, ~10ms with Redis stopped. |
 | 30s background processing | Celery task with a configurable delay (`TRANSACTION_PROCESSING_DELAY_SECONDS`). The thread pool (32 threads) runs many sleeps in parallel because the work is I/O-bound. |
-| Idempotency | A `UNIQUE` constraint on `transaction_id`. Concurrent duplicates race on the constraint and exactly one wins; this is tested with 8 simultaneous threads. Only the winner enqueues a task. The task's conditional update protects against duplicate deliveries. |
+| Idempotency | A `UNIQUE` constraint on `transaction_id`. Concurrent duplicates race on the constraint and exactly one wins; this is tested with 8 simultaneous threads. Only the winner enqueues a task. If a task is delivered twice (Redis redelivery, the sweep), the processing lease lets only one copy run the external call; this is also tested with 8 simultaneous threads. |
 | Persistent storage | PostgreSQL (AWS RDS) stores status, `created_at`, `processed_at` and `updated_at`. |
 | No lost transactions | The row is persisted before the ack. Tasks use `acks_late` + `reject_on_worker_lost`, so a crash re-queues the message. Redis keeps an append-only file. The recovery sweep covers every remaining gap. Verified by killing the worker with `SIGKILL` mid-task and by stopping Redis while webhooks were arriving; every transaction ended `PROCESSED`. |
 
@@ -67,11 +67,13 @@ flowchart LR
 - **Django + DRF.** Mature, with explicit `APIView` endpoints and serializer validation. The database logic sits in a small service layer (`apps/transactions/services.py`) and the Celery side in `tasks.py`, so the views stay thin.
 - **PostgreSQL as the source of truth, Redis as the broker only.** Durability lives in the database, not the queue. Losing Redis loses no data; it only delays processing until the sweep runs.
 - **Celery with acks_late and a threads pool.** Celery is a proven task queue with built-in retries and a beat scheduler. The threads pool suits sleep-heavy, I/O-bound work. The DB connection is released during the 30s wait, so long tasks don't use up RDS connections.
-- **Idempotency in the database, not in application code.** A unique constraint is the only check that stays correct across multiple web processes and hosts.
+- **Idempotency in the database, not in application code.** A unique constraint for ingestion, and a conditional-update lease for processing, are the only checks that stay correct across multiple web processes, workers and hosts.
 - **Single EC2 host + RDS (AWS free tier).** Docker Compose runs web, worker and Redis on one instance. This is the simplest setup that meets the brief; the trade-offs are listed below.
 
+**Security scope.** The brief asks for a public endpoint that accepts these webhooks, so the live deployment accepts unsigned requests and the status endpoint is open. Signature verification is built in: set `TRANSACTION_WEBHOOK_SECRET` and every webhook must carry `X-Webhook-Signature`, the hex HMAC-SHA256 of the raw body (the scheme Razorpay uses). Unsigned or wrongly signed requests then get `403`. It stays off on the live URL so the assessment's test webhooks work. Production settings refuse to start without a real `SECRET_KEY`.
+
 **Trade-offs and what I'd add for production:**
-- **Webhook authentication:** verify the processor's HMAC signature (e.g. `X-Razorpay-Signature`) before accepting.
+- **Transport and access:** HTTPS via CloudFront or an ALB, signatures switched on, and authentication on the status endpoint.
 - **Payload conflicts:** a duplicate `transaction_id` with a *different* payload is currently ignored. I'd log or alert on it.
 - **Managed queue:** replace Redis with SQS (or ElastiCache) and run web and worker separately, so each can autoscale.
 - **Permanent failures:** add a `FAILED` state with a retry limit and a dead-letter queue. The only failure today is a simulated sleep, so retries are effectively unlimited.
@@ -87,7 +89,7 @@ docker compose up -d --build
 curl http://localhost:8000/
 ```
 
-**Or run Django and Celery with uv** (Postgres on `:5435` and Redis on `:6381` stay in Docker):
+**Or run Django and Celery with uv** (Postgres 18 on `:5435`, the same major version as production, and Redis on `:6381` stay in Docker):
 ```bash
 make dev                 # start Postgres + Redis
 uv sync
@@ -98,7 +100,7 @@ make worker              # in another terminal: Celery worker + recovery sweep
 
 ## Testing
 
-**Unit and integration tests** (pytest-django, 26 tests; needs `make dev`):
+**Unit and integration tests** (pytest-django, 48 tests; needs `make dev`):
 ```bash
 make test
 ```
@@ -106,11 +108,14 @@ They cover:
 - the health check format
 - the 202 response and persisted state
 - sequential duplicates and 8-thread concurrent duplicates
-- validation errors and malformed JSON
+- validation errors and malformed JSON, including non-ASCII currencies and amounts too large to round-trip
+- optional HMAC signature verification
 - acknowledging while the broker is down
 - the response shape (list, numeric amount, `Z` timestamps)
 - task processing, redelivery and failure handling
-- the recovery sweep
+- the processing lease: 8 concurrent claims grant exactly one, takeover after a crash, a stale token can't complete, release on failure
+- the recovery sweep and the bounded publish queue
+- production settings refusing a missing or placeholder `SECRET_KEY`
 
 **End-to-end smoke test** of the assessment's success criteria, against any deployment. It uses only the Python standard library:
 ```bash
@@ -143,10 +148,14 @@ All settings come from environment variables (see `.env.example`).
 | `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` | local Docker values | Postgres connection |
 | `DB_SSLMODE` | `prefer` | Use `require` for RDS |
 | `REDIS_URL` | `redis://localhost:6381/0` | Celery broker |
+| `SECRET_KEY` | none in production | Required; production refuses to start without a real value |
 | `TRANSACTION_PROCESSING_DELAY_SECONDS` | `30` | Simulated external call |
+| `TRANSACTION_PROCESSING_LEASE_SECONDS` | `120` | How long a worker's processing lease lasts before another worker may take it over |
 | `TRANSACTION_STALE_AFTER_SECONDS` | `300` | Age at which a `PROCESSING` row is re-enqueued |
 | `TRANSACTION_RECOVERY_INTERVAL_SECONDS` | `60` | How often the sweep runs |
 | `CELERY_VISIBILITY_TIMEOUT` | `300` | Redis redelivery window for unacknowledged tasks |
+| `TRANSACTION_PUBLISH_BACKLOG` | `1000` | Webhooks that can wait to be published; beyond this they're left to the sweep |
+| `TRANSACTION_WEBHOOK_SECRET` | empty (off) | When set, webhooks must carry a valid `X-Webhook-Signature` |
 
 ## Deployment (AWS)
 
@@ -166,8 +175,9 @@ config/                  settings (base/development/production), Celery app, URL
 apps/transactions/
   models.py              Transaction (unique transaction_id, status, timestamps)
   serializers.py         request validation and response shapes
-  services.py            DB logic: idempotent ingest, claim, complete, claim_stale
-  tasks.py               off-request enqueue, process_transaction, recover_stale_transactions
+  services.py            DB logic: idempotent ingest, lease claim/complete/release, claim_stale
+  tasks.py               bounded off-request publisher, process_transaction, recover_stale_transactions
+  permissions.py         optional HMAC webhook signature check
   views.py / urls.py     health, webhook and status endpoints
   tests/                 pytest suite
 scripts/smoke_test.py    end-to-end success-criteria check

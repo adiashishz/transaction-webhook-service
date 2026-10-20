@@ -85,11 +85,19 @@ SPECTACULAR_SETTINGS = {
 
 # Transaction processing
 TRANSACTION_PROCESSING_DELAY_SECONDS = config("TRANSACTION_PROCESSING_DELAY_SECONDS", default=30, cast=float)
+# Only one worker may run the external call for a transaction at a time. A lease older than this is assumed to
+# belong to a crashed worker and can be taken over. Must exceed the processing delay and be below the stale window.
+TRANSACTION_PROCESSING_LEASE_SECONDS = config("TRANSACTION_PROCESSING_LEASE_SECONDS", default=120, cast=int)
 # A PROCESSING row untouched for this long is assumed lost (worker crash, broker outage) and re-enqueued.
 # Must comfortably exceed the processing delay so in-flight work is never treated as stale.
 TRANSACTION_STALE_AFTER_SECONDS = config("TRANSACTION_STALE_AFTER_SECONDS", default=300, cast=int)
 TRANSACTION_RECOVERY_INTERVAL_SECONDS = config("TRANSACTION_RECOVERY_INTERVAL_SECONDS", default=60, cast=int)
 TRANSACTION_RECOVERY_BATCH_SIZE = config("TRANSACTION_RECOVERY_BATCH_SIZE", default=500, cast=int)
+# Webhooks waiting to be published to the broker; beyond this they are left to the recovery sweep.
+TRANSACTION_PUBLISH_BACKLOG = config("TRANSACTION_PUBLISH_BACKLOG", default=1000, cast=int)
+# When set, webhooks must carry X-Webhook-Signature: hex HMAC-SHA256 of the raw body with this secret.
+# Empty by default so the assessment's unsigned test webhooks are accepted.
+TRANSACTION_WEBHOOK_SECRET = config("TRANSACTION_WEBHOOK_SECRET", default="")
 
 # Celery (Redis is the broker only; results live in Postgres)
 CELERY_BROKER_URL = config("REDIS_URL", default="redis://localhost:6381/0")

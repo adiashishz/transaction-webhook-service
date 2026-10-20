@@ -17,12 +17,13 @@ def enqueued(monkeypatch):
     return calls
 
 
-class InlineExecutor:
-    def submit(self, fn, *args):
-        fn(*args)
+class InlinePublisher:
+    def submit(self, txn_pk):
+        tasks.enqueue_transaction(txn_pk)
+        return True
 
 
 @pytest.fixture(autouse=True)
 def _inline_publisher(monkeypatch):
     """Run the off-request broker publish inline so tests are deterministic."""
-    monkeypatch.setattr(tasks, "_publisher", InlineExecutor())
+    monkeypatch.setattr(tasks, "_publisher", InlinePublisher())

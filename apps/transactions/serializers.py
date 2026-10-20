@@ -1,3 +1,4 @@
+import re
 from decimal import Decimal
 
 from rest_framework import serializers
@@ -9,11 +10,12 @@ class TransactionWebhookSerializer(serializers.Serializer):
     transaction_id = serializers.CharField(max_length=255)
     source_account = serializers.CharField(max_length=255)
     destination_account = serializers.CharField(max_length=255)
-    amount = serializers.DecimalField(max_digits=18, decimal_places=2, min_value=Decimal("0.01"))
+    amount = serializers.DecimalField(max_digits=15, decimal_places=2, min_value=Decimal("0.01"))
     currency = serializers.CharField(min_length=3, max_length=3)
 
     def validate_currency(self, value):
-        if not value.isalpha():
+        # ASCII only: str.isalpha() accepts any Unicode letter, and upper() can lengthen it ('ß' -> 'SS').
+        if not re.fullmatch(r"[A-Za-z]{3}", value):
             raise serializers.ValidationError("Currency must be a 3-letter ISO 4217 code.")
         return value.upper()
 

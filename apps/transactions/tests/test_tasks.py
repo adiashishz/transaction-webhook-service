@@ -5,6 +5,7 @@ from django.utils import timezone
 
 from apps.transactions import tasks
 from apps.transactions.models import Transaction
+from apps.transactions.services import TransactionService
 from apps.transactions.tests.factories import create_transaction
 
 pytestmark = pytest.mark.django_db
@@ -55,7 +56,29 @@ def test_failure_during_processing_leaves_transaction_retryable(monkeypatch):
     with pytest.raises(RuntimeError):
         tasks.process_transaction(str(txn.pk))
 
+    txn.refresh_from_db()
+    # The lease is released so the retry can claim the transaction immediately.
+    assert (txn.status, txn.processing_started_at) == ("PROCESSING", None)
+
+
+def test_duplicate_delivery_skips_while_another_worker_holds_the_lease(monkeypatch):
+    txn = create_transaction()
+    TransactionService.claim(str(txn.pk))
+    calls = []
+    monkeypatch.setattr(tasks, "simulate_external_call", lambda: calls.append(True))
+
+    assert tasks.process_transaction(str(txn.pk)) == "skipped"
+    assert calls == []
     assert Transaction.objects.get(pk=txn.pk).status == "PROCESSING"
+
+
+def test_crashed_workers_expired_lease_is_taken_over(settings):
+    settings.TRANSACTION_PROCESSING_LEASE_SECONDS = 120
+    txn = create_transaction()
+    Transaction.objects.filter(pk=txn.pk).update(processing_started_at=timezone.now() - timedelta(seconds=600))
+
+    assert tasks.process_transaction(str(txn.pk)) == "processed"
+    assert Transaction.objects.get(pk=txn.pk).status == "PROCESSED"
 
 
 def test_recovery_sweep_reenqueues_only_stale_processing_rows(settings, enqueued):

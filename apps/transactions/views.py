@@ -1,4 +1,4 @@
-from django.http import Http404
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.transactions.models import Transaction
+from apps.transactions.permissions import WebhookSignaturePermission
 from apps.transactions.serializers import (
     HealthSerializer,
     TransactionSerializer,
@@ -23,6 +24,8 @@ class HealthCheckView(APIView):
 
 
 class TransactionWebhookView(APIView):
+    permission_classes = [WebhookSignaturePermission]
+
     @extend_schema(request=TransactionWebhookSerializer, responses={202: WebhookAcknowledgementSerializer})
     def post(self, request):
         serializer = TransactionWebhookSerializer(data=request.data)
@@ -44,8 +47,6 @@ class TransactionWebhookView(APIView):
 class TransactionDetailView(APIView):
     @extend_schema(responses=TransactionSerializer(many=True))
     def get(self, request, transaction_id):
-        txn = Transaction.objects.filter(transaction_id=transaction_id).first()
-        if txn is None:
-            raise Http404
+        txn = get_object_or_404(Transaction, transaction_id=transaction_id)
         # The assessment's example response is a single-element list.
         return Response([TransactionSerializer(txn).data])
